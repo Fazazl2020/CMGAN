@@ -51,19 +51,10 @@ class DemandDataset(torch.utils.data.Dataset):
         return clean_ds, noisy_ds, length
 
 
-def load_data(ds_dir, batch_size, n_cpu, cut_len, distributed=False):
+def load_data(ds_dir, batch_size, n_cpu, cut_len):
     """
-    Load training and test datasets.
-
-    Args:
-        ds_dir: Root directory of the dataset
-        batch_size: Batch size per GPU
-        n_cpu: Number of worker processes for data loading
-        cut_len: Length to cut audio samples
-        distributed: Whether to use distributed training (DistributedSampler)
-
-    Returns:
-        train_dataset, test_dataset: DataLoader objects
+    Load training and test datasets (same as baseline).
+    Always uses DistributedSampler for DDP training.
     """
     torchaudio.set_audio_backend("sox_io")  # in linux
     train_dir = os.path.join(ds_dir, "train")
@@ -72,22 +63,12 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len, distributed=False):
     train_ds = DemandDataset(train_dir, cut_len)
     test_ds = DemandDataset(test_dir, cut_len)
 
-    # Use DistributedSampler only when distributed training is enabled
-    if distributed:
-        train_sampler = DistributedSampler(train_ds, shuffle=True)
-        test_sampler = DistributedSampler(test_ds, shuffle=False)
-        shuffle_train = False  # Sampler handles shuffling
-    else:
-        train_sampler = None
-        test_sampler = None
-        shuffle_train = True
-
     train_dataset = torch.utils.data.DataLoader(
         dataset=train_ds,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=shuffle_train,
-        sampler=train_sampler,
+        shuffle=False,
+        sampler=DistributedSampler(train_ds),
         drop_last=True,
         num_workers=n_cpu,
     )
@@ -96,7 +77,7 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len, distributed=False):
         batch_size=batch_size,
         pin_memory=True,
         shuffle=False,
-        sampler=test_sampler,
+        sampler=DistributedSampler(test_ds),
         drop_last=False,
         num_workers=n_cpu,
     )

@@ -7,27 +7,26 @@ import torch
 from utils import power_compress, power_uncompress
 import logging
 from torchinfo import summary
-import argparse
 
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=120, help="number of epochs of training")
-parser.add_argument("--batch_size", type=int, default=4)
-parser.add_argument("--log_interval", type=int, default=500)
-parser.add_argument("--decay_epoch", type=int, default=30, help="epoch from which to start lr decay")
-parser.add_argument("--init_lr", type=float, default=5e-4, help="initial learning rate")
-parser.add_argument("--cut_len", type=int, default=16000*2, help="cut length, default is 2 seconds in denoise "
-                                                                 "and dereverberation")
-parser.add_argument("--data_dir", type=str, default='dir to VCTK-DEMAND dataset',
-                    help="dir of VCTK+DEMAND dataset")
-parser.add_argument("--save_model_dir", type=str, default='./saved_model',
-                    help="dir of saved model")
-parser.add_argument("--loss_weights", type=list, default=[0.1, 0.9, 0.2, 0.05],
-                    help="weights of RI components, magnitude, time loss, and Metric Disc")
-args = parser.parse_args()
+# ============== CONFIGURATION ==============
+# Modify these values according to your setup
+CONFIG = {
+    "epochs": 120,                      # number of epochs of training
+    "batch_size": 4,                    # batch size
+    "log_interval": 500,                # logging interval
+    "decay_epoch": 30,                  # epoch from which to start lr decay
+    "init_lr": 5e-4,                    # initial learning rate
+    "cut_len": 16000 * 2,               # cut length, 2 seconds for denoise/dereverberation
+    "data_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/",  # dataset directory
+    "save_model_dir": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN",  # directory to save model checkpoints
+    "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
+}
+# ===========================================
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -50,19 +49,19 @@ class Trainer:
         self.test_ds = test_ds
         self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).cuda()
         summary(
-            self.model, [(1, 2, args.cut_len // self.hop + 1, int(self.n_fft / 2) + 1)]
+            self.model, [(1, 2, CONFIG["cut_len"] // self.hop + 1, int(self.n_fft / 2) + 1)]
         )
         self.discriminator = discriminator.Discriminator(ndf=16).cuda()
         summary(
             self.discriminator,
             [
-                (1, 1, int(self.n_fft / 2) + 1, args.cut_len // self.hop + 1),
-                (1, 1, int(self.n_fft / 2) + 1, args.cut_len // self.hop + 1),
+                (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
+                (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
             ],
         )
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.init_lr)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=CONFIG["init_lr"])
         self.optimizer_disc = torch.optim.AdamW(
-            self.discriminator.parameters(), lr=2 * args.init_lr
+            self.discriminator.parameters(), lr=2 * CONFIG["init_lr"]
         )
 
         self.model = DDP(self.model, device_ids=[gpu_id])
@@ -142,10 +141,10 @@ class Trainer:
         )
 
         loss = (
-            args.loss_weights[0] * loss_ri
-            + args.loss_weights[1] * loss_mag
-            + args.loss_weights[2] * time_loss
-            + args.loss_weights[3] * gen_loss_GAN
+            CONFIG["loss_weights"][0] * loss_ri
+            + CONFIG["loss_weights"][1] * loss_mag
+            + CONFIG["loss_weights"][2] * time_loss
+            + CONFIG["loss_weights"][3] * gen_loss_GAN
         )
 
         return loss
@@ -178,7 +177,7 @@ class Trainer:
         # Trainer generator
         clean = batch[0].to(self.gpu_id)
         noisy = batch[1].to(self.gpu_id)
-        one_labels = torch.ones(args.batch_size).to(self.gpu_id)
+        one_labels = torch.ones(CONFIG["batch_size"]).to(self.gpu_id)
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -209,7 +208,7 @@ class Trainer:
 
         clean = batch[0].to(self.gpu_id)
         noisy = batch[1].to(self.gpu_id)
-        one_labels = torch.ones(args.batch_size).to(self.gpu_id)
+        one_labels = torch.ones(CONFIG["batch_size"]).to(self.gpu_id)
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -246,45 +245,45 @@ class Trainer:
 
     def train(self):
         scheduler_G = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=args.decay_epoch, gamma=0.5
+            self.optimizer, step_size=CONFIG["decay_epoch"], gamma=0.5
         )
         scheduler_D = torch.optim.lr_scheduler.StepLR(
-            self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
+            self.optimizer_disc, step_size=CONFIG["decay_epoch"], gamma=0.5
         )
-        for epoch in range(args.epochs):
+        for epoch in range(CONFIG["epochs"]):
             self.model.train()
             self.discriminator.train()
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
                 loss, disc_loss = self.train_step(batch)
                 template = "GPU: {}, Epoch {}, Step {}, loss: {}, disc_loss: {}"
-                if (step % args.log_interval) == 0:
+                if (step % CONFIG["log_interval"]) == 0:
                     logging.info(
                         template.format(self.gpu_id, epoch, step, loss, disc_loss)
                     )
             gen_loss = self.test()
             path = os.path.join(
-                args.save_model_dir,
+                CONFIG["save_model_dir"],
                 "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
             )
-            if not os.path.exists(args.save_model_dir):
-                os.makedirs(args.save_model_dir)
+            if not os.path.exists(CONFIG["save_model_dir"]):
+                os.makedirs(CONFIG["save_model_dir"])
             if self.gpu_id == 0:
                 torch.save(self.model.module.state_dict(), path)
             scheduler_G.step()
             scheduler_D.step()
 
 
-def main(rank: int, world_size: int, args):
+def main(rank: int, world_size: int):
     ddp_setup(rank, world_size)
     if rank == 0:
-        print(args)
+        print("Configuration:", CONFIG)
         available_gpus = [
             torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
         ]
-        print(available_gpus)
+        print("Available GPUs:", available_gpus)
     train_ds, test_ds = dataloader.load_data(
-        args.data_dir, args.batch_size, 2, args.cut_len
+        CONFIG["data_dir"], CONFIG["batch_size"], 2, CONFIG["cut_len"]
     )
     trainer = Trainer(train_ds, test_ds, rank)
     trainer.train()
@@ -294,4 +293,4 @@ def main(rank: int, world_size: int, args):
 if __name__ == "__main__":
 
     world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size, args), nprocs=world_size)
+    mp.spawn(main, args=(world_size,), nprocs=world_size)

@@ -6,7 +6,16 @@ from tools.compute_metrics import compute_metrics
 from utils import *
 import torchaudio
 import soundfile as sf
-import argparse
+
+# ============== CONFIGURATION ==============
+# Modify these values according to your setup
+CONFIG = {
+    "model_path": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN/best_ckpt",  # path to trained model checkpoint
+    "test_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/test",  # test dataset directory
+    "save_tracks": True,  # save enhanced audio tracks or not
+    "save_dir": "/gdata/fewahab/Sun-Models/Ab-5/CMGAN/saved_tracks",  # directory to save enhanced tracks
+}
+# ===========================================
 
 
 @torch.no_grad()
@@ -100,18 +109,7 @@ def evaluation(model_path, noisy_dir, clean_dir, save_tracks, saved_dir):
     )
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--model_path", type=str, default='./best_ckpt/ckpt_80',
-                    help="the path where the model is saved")
-parser.add_argument("--test_dir", type=str, default='dir to your VCTK-DEMAND test dataset',
-                    help="noisy tracks dir to be enhanced")
-parser.add_argument("--save_tracks", type=str, default=True, help="save predicted tracks or not")
-parser.add_argument("--save_dir", type=str, default='./saved_tracks_best', help="where enhanced tracks to be saved")
-
-args = parser.parse_args()
-
-
 if __name__ == "__main__":
-    noisy_dir = os.path.join(args.test_dir, "noisy")
-    clean_dir = os.path.join(args.test_dir, "clean")
-    evaluation(args.model_path, noisy_dir, clean_dir, args.save_tracks, args.save_dir)
+    noisy_dir = os.path.join(CONFIG["test_dir"], "noisy")
+    clean_dir = os.path.join(CONFIG["test_dir"], "clean")
+    evaluation(CONFIG["model_path"], noisy_dir, clean_dir, CONFIG["save_tracks"], CONFIG["save_dir"])

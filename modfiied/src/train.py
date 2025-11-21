@@ -4,7 +4,8 @@ import os
 
 # ============== ENVIRONMENT SETUP FOR MULTI-GPU ==============
 # These must be set BEFORE importing torch
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8")
+# Note: PYTORCH_CUDA_ALLOC_CONF options like expandable_segments require PyTorch 2.0+
+# Keeping only NCCL error handling for compatibility with older PyTorch versions
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 # =============================================================
 

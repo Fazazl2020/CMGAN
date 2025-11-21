@@ -1,4 +1,5 @@
 import torch.utils.data
+import torch.distributed as dist
 import torchaudio
 import os
 from utils import *
@@ -53,8 +54,8 @@ class DemandDataset(torch.utils.data.Dataset):
 
 def load_data(ds_dir, batch_size, n_cpu, cut_len):
     """
-    Load training and test datasets (same as baseline).
-    Always uses DistributedSampler for DDP training.
+    Load training and test datasets.
+    Automatically detects if distributed training is enabled.
     """
     torchaudio.set_audio_backend("sox_io")  # in linux
     train_dir = os.path.join(ds_dir, "train")
@@ -63,12 +64,24 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len):
     train_ds = DemandDataset(train_dir, cut_len)
     test_ds = DemandDataset(test_dir, cut_len)
 
+    # Check if distributed training is enabled
+    distributed = dist.is_initialized()
+
+    if distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True)
+        test_sampler = DistributedSampler(test_ds, shuffle=False)
+        shuffle_train = False  # Sampler handles shuffling
+    else:
+        train_sampler = None
+        test_sampler = None
+        shuffle_train = True
+
     train_dataset = torch.utils.data.DataLoader(
         dataset=train_ds,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=False,
-        sampler=DistributedSampler(train_ds),
+        shuffle=shuffle_train,
+        sampler=train_sampler,
         drop_last=True,
         num_workers=n_cpu,
     )
@@ -77,7 +90,7 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len):
         batch_size=batch_size,
         pin_memory=True,
         shuffle=False,
-        sampler=DistributedSampler(test_ds),
+        sampler=test_sampler,
         drop_last=False,
         num_workers=n_cpu,
     )

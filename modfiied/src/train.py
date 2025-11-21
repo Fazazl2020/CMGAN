@@ -1,6 +1,13 @@
 from models.generator import TSCNet
 from models import discriminator
 import os
+
+# ============== ENVIRONMENT SETUP FOR MULTI-GPU ==============
+# These must be set BEFORE importing torch
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8")
+os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+# =============================================================
+
 from data import dataloader
 import torch.nn.functional as F
 import torch
@@ -8,15 +15,14 @@ from utils import power_compress, power_uncompress
 import logging
 from torchinfo import summary
 
-import torch.multiprocessing as mp
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 
 # ============== CONFIGURATION ==============
 # Modify these values according to your setup
 CONFIG = {
     "epochs": 120,                      # number of epochs of training
-    "batch_size": 4,                    # batch size
+    "batch_size": 4,                    # batch size PER GPU
     "log_interval": 500,                # logging interval
     "decay_epoch": 30,                  # epoch from which to start lr decay
     "init_lr": 5e-4,                    # initial learning rate
@@ -30,43 +36,86 @@ CONFIG = {
 logging.basicConfig(level=logging.INFO)
 
 
-def ddp_setup(rank, world_size):
+def setup_distributed():
     """
-    Args:
-        rank: Unique identifier of each process
-        world_size: Total number of processes
+    Initialize distributed training using environment variables set by torchrun.
     """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        print("Not using distributed mode")
+        return False, 0, 0, 1
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
+    dist.barrier()
+    return True, rank, local_rank, world_size
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if current process is the main process (rank 0)."""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def get_rank():
+    """Get current process rank."""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
 
 
 class Trainer:
-    def __init__(self, train_ds, test_ds, gpu_id: int):
+    def __init__(self, train_ds, test_ds, local_rank: int, distributed: bool = False):
         self.n_fft = 400
         self.hop = 100
         self.train_ds = train_ds
         self.test_ds = test_ds
-        self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).cuda()
-        summary(
-            self.model, [(1, 2, CONFIG["cut_len"] // self.hop + 1, int(self.n_fft / 2) + 1)]
-        )
-        self.discriminator = discriminator.Discriminator(ndf=16).cuda()
-        summary(
-            self.discriminator,
-            [
-                (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
-                (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
-            ],
-        )
+        self.local_rank = local_rank
+        self.distributed = distributed
+
+        # Create models on the correct GPU
+        self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).to(local_rank)
+
+        if is_main_process():
+            summary(
+                self.model, [(1, 2, CONFIG["cut_len"] // self.hop + 1, int(self.n_fft / 2) + 1)]
+            )
+
+        self.discriminator = discriminator.Discriminator(ndf=16).to(local_rank)
+
+        if is_main_process():
+            summary(
+                self.discriminator,
+                [
+                    (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
+                    (1, 1, int(self.n_fft / 2) + 1, CONFIG["cut_len"] // self.hop + 1),
+                ],
+            )
+
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=CONFIG["init_lr"])
         self.optimizer_disc = torch.optim.AdamW(
             self.discriminator.parameters(), lr=2 * CONFIG["init_lr"]
         )
 
-        self.model = DDP(self.model, device_ids=[gpu_id])
-        self.discriminator = DDP(self.discriminator, device_ids=[gpu_id])
-        self.gpu_id = gpu_id
+        # Wrap models with DDP if distributed
+        if distributed:
+            self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank)
+            self.discriminator = DDP(self.discriminator, device_ids=[local_rank], output_device=local_rank)
 
     def forward_generator_step(self, clean, noisy):
 
@@ -81,14 +130,14 @@ class Trainer:
             noisy,
             self.n_fft,
             self.hop,
-            window=torch.hamming_window(self.n_fft).to(self.gpu_id),
+            window=torch.hamming_window(self.n_fft).to(self.local_rank),
             onesided=True,
         )
         clean_spec = torch.stft(
             clean,
             self.n_fft,
             self.hop,
-            window=torch.hamming_window(self.n_fft).to(self.gpu_id),
+            window=torch.hamming_window(self.n_fft).to(self.local_rank),
             onesided=True,
         )
         noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
@@ -106,7 +155,7 @@ class Trainer:
             est_spec_uncompress,
             self.n_fft,
             self.hop,
-            window=torch.hamming_window(self.n_fft).to(self.gpu_id),
+            window=torch.hamming_window(self.n_fft).to(self.local_rank),
             onesided=True,
         )
 
@@ -175,9 +224,9 @@ class Trainer:
     def train_step(self, batch):
 
         # Trainer generator
-        clean = batch[0].to(self.gpu_id)
-        noisy = batch[1].to(self.gpu_id)
-        one_labels = torch.ones(CONFIG["batch_size"]).to(self.gpu_id)
+        clean = batch[0].to(self.local_rank)
+        noisy = batch[1].to(self.local_rank)
+        one_labels = torch.ones(clean.size(0)).to(self.local_rank)  # Use actual batch size
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -206,9 +255,9 @@ class Trainer:
     @torch.no_grad()
     def test_step(self, batch):
 
-        clean = batch[0].to(self.gpu_id)
-        noisy = batch[1].to(self.gpu_id)
-        one_labels = torch.ones(CONFIG["batch_size"]).to(self.gpu_id)
+        clean = batch[0].to(self.local_rank)
+        noisy = batch[1].to(self.local_rank)
+        one_labels = torch.ones(clean.size(0)).to(self.local_rank)  # Use actual batch size
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -239,7 +288,7 @@ class Trainer:
         disc_loss_avg = disc_loss_total / step
 
         template = "GPU: {}, Generator loss: {}, Discriminator loss: {}"
-        logging.info(template.format(self.gpu_id, gen_loss_avg, disc_loss_avg))
+        logging.info(template.format(self.local_rank, gen_loss_avg, disc_loss_avg))
 
         return gen_loss_avg
 
@@ -250,47 +299,78 @@ class Trainer:
         scheduler_D = torch.optim.lr_scheduler.StepLR(
             self.optimizer_disc, step_size=CONFIG["decay_epoch"], gamma=0.5
         )
+
         for epoch in range(CONFIG["epochs"]):
+            # Set epoch for distributed sampler (important for proper shuffling!)
+            if self.distributed and hasattr(self.train_ds, 'sampler') and self.train_ds.sampler is not None:
+                self.train_ds.sampler.set_epoch(epoch)
+
             self.model.train()
             self.discriminator.train()
+
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
                 loss, disc_loss = self.train_step(batch)
                 template = "GPU: {}, Epoch {}, Step {}, loss: {}, disc_loss: {}"
                 if (step % CONFIG["log_interval"]) == 0:
                     logging.info(
-                        template.format(self.gpu_id, epoch, step, loss, disc_loss)
+                        template.format(self.local_rank, epoch, step, loss, disc_loss)
                     )
+
             gen_loss = self.test()
-            path = os.path.join(
-                CONFIG["save_model_dir"],
-                "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
-            )
-            if not os.path.exists(CONFIG["save_model_dir"]):
-                os.makedirs(CONFIG["save_model_dir"])
-            if self.gpu_id == 0:
-                torch.save(self.model.module.state_dict(), path)
+
+            # Only main process saves checkpoints (avoid race condition)
+            if is_main_process():
+                if not os.path.exists(CONFIG["save_model_dir"]):
+                    os.makedirs(CONFIG["save_model_dir"])
+
+                path = os.path.join(
+                    CONFIG["save_model_dir"],
+                    "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
+                )
+                # Save model state dict (unwrap DDP if needed)
+                model_to_save = self.model.module if self.distributed else self.model
+                torch.save(model_to_save.state_dict(), path)
+
+            # Synchronize all processes before next epoch
+            if dist.is_initialized():
+                dist.barrier()
+
             scheduler_G.step()
             scheduler_D.step()
 
 
-def main(rank: int, world_size: int):
-    ddp_setup(rank, world_size)
-    if rank == 0:
+def main():
+    # Setup distributed training
+    distributed, rank, local_rank, world_size = setup_distributed()
+
+    if is_main_process():
+        print("=" * 50)
+        print("CMGAN Training")
+        print("=" * 50)
         print("Configuration:", CONFIG)
+        print(f"Distributed: {distributed}")
+        print(f"World size (GPUs): {world_size}")
         available_gpus = [
             torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
         ]
         print("Available GPUs:", available_gpus)
+        print("=" * 50)
+
+    # Load data with distributed sampler
     train_ds, test_ds = dataloader.load_data(
-        CONFIG["data_dir"], CONFIG["batch_size"], 2, CONFIG["cut_len"]
+        CONFIG["data_dir"],
+        CONFIG["batch_size"],
+        2,  # num_workers
+        CONFIG["cut_len"],
+        distributed=distributed
     )
-    trainer = Trainer(train_ds, test_ds, rank)
+
+    trainer = Trainer(train_ds, test_ds, local_rank, distributed)
     trainer.train()
-    destroy_process_group()
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
-
-    world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size,), nprocs=world_size)
+    main()

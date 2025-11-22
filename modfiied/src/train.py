@@ -409,7 +409,7 @@ class Trainer:
         # Trainer generator
         clean = batch[0].to(self.device)
         noisy = batch[1].to(self.device)
-        one_labels = torch.ones(CONFIG["batch_size"]).to(self.device)
+        one_labels = torch.ones(clean.size(0)).to(self.device)  # Use actual batch size
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -437,10 +437,10 @@ class Trainer:
 
     @torch.no_grad()
     def test_step(self, batch):
-
+        """Run test step and return loss, disc_loss, and estimated audio for PESQ."""
         clean = batch[0].to(self.device)
         noisy = batch[1].to(self.device)
-        one_labels = torch.ones(CONFIG["batch_size"]).to(self.device)
+        one_labels = torch.ones(clean.size(0)).to(self.device)  # Use actual batch size
 
         generator_outputs = self.forward_generator_step(
             clean,
@@ -455,7 +455,8 @@ class Trainer:
         if discrim_loss_metric is None:
             discrim_loss_metric = torch.tensor([0.0])
 
-        return loss.item(), discrim_loss_metric.item()
+        # Return est_audio and clean for PESQ calculation (avoid double forward pass)
+        return loss.item(), discrim_loss_metric.item(), generator_outputs["est_audio"], clean
 
     def test(self):
         """Run test/validation and compute PESQ score."""
@@ -467,18 +468,11 @@ class Trainer:
 
         for idx, batch in enumerate(self.test_ds):
             step = idx + 1
-            loss, disc_loss = self.test_step(batch)
+            loss, disc_loss, est_audio, clean = self.test_step(batch)
             gen_loss_total += loss
             disc_loss_total += disc_loss
 
-            # Calculate PESQ for this batch
-            clean = batch[0].to(self.device)
-            noisy = batch[1].to(self.device)
-            with torch.no_grad():
-                outputs = self.forward_generator_step(clean, noisy)
-                est_audio = outputs["est_audio"]
-
-            # Compute PESQ for each sample in batch
+            # Compute PESQ for each sample in batch (using output from test_step)
             length = est_audio.size(-1)
             for i in range(est_audio.size(0)):
                 try:

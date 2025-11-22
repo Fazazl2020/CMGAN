@@ -1,6 +1,8 @@
 from models.generator import TSCNet
 from models import discriminator
 import os
+import csv
+from datetime import datetime
 
 # ============== ENVIRONMENT SETUP FOR MULTI-GPU ==============
 # These must be set BEFORE importing torch
@@ -24,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 CONFIG = {
     "epochs": 120,                      # number of epochs of training
     "batch_size": 1,                    # batch size PER GPU (reduced to 1 for tight GPU memory)
-    "log_interval": 500,                # logging interval
+    "log_interval": 500,                # logging interval (steps)
     "decay_epoch": 30,                  # epoch from which to start lr decay
     "init_lr": 5e-4,                    # initial learning rate
     "cut_len": 16000 * 2,               # cut length, 2 seconds for denoise/dereverberation
@@ -33,12 +35,61 @@ CONFIG = {
     "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
     # ============== RESUME SETTINGS ==============
     "resume": False,                    # Set to True to resume training
-    "resume_checkpoint": "",            # Path to checkpoint file to resume from (e.g., "/path/to/checkpoint_epoch_10.pth")
+    "resume_checkpoint": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN/checkpoint_epoch_0.pth",  # Full checkpoint path
     # =============================================
 }
 # ===========================================
 
 logging.basicConfig(level=logging.INFO)
+
+
+class TrainingLogger:
+    """Logger to save training metrics to CSV files."""
+
+    def __init__(self, save_dir, resume=False):
+        self.save_dir = save_dir
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # File paths
+        self.step_log_path = os.path.join(save_dir, "training_step_log.csv")
+        self.epoch_log_path = os.path.join(save_dir, "training_epoch_log.csv")
+
+        # Initialize CSV files (append mode if resuming)
+        mode = 'a' if resume and os.path.exists(self.step_log_path) else 'w'
+
+        if mode == 'w':
+            # Create step log with headers
+            with open(self.step_log_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp', 'epoch', 'step', 'gen_loss', 'disc_loss', 'lr_gen', 'lr_disc'])
+
+            # Create epoch log with headers
+            with open(self.epoch_log_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp', 'epoch', 'train_gen_loss_avg', 'train_disc_loss_avg',
+                               'test_gen_loss', 'test_disc_loss', 'lr_gen', 'lr_disc'])
+
+    def log_step(self, epoch, step, gen_loss, disc_loss, lr_gen, lr_disc):
+        """Log metrics for a single training step."""
+        with open(self.step_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                epoch, step, f"{gen_loss:.6f}", f"{disc_loss:.6f}",
+                f"{lr_gen:.8f}", f"{lr_disc:.8f}"
+            ])
+
+    def log_epoch(self, epoch, train_gen_loss, train_disc_loss, test_gen_loss, test_disc_loss, lr_gen, lr_disc):
+        """Log metrics for a complete epoch."""
+        with open(self.epoch_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                epoch, f"{train_gen_loss:.6f}", f"{train_disc_loss:.6f}",
+                f"{test_gen_loss:.6f}", f"{test_disc_loss:.6f}",
+                f"{lr_gen:.8f}", f"{lr_disc:.8f}"
+            ])
 
 
 def init_distributed_mode():
@@ -100,6 +151,12 @@ class Trainer:
         self.local_rank = local_rank
         self.distributed = distributed
         self.start_epoch = 0  # Will be updated if resuming
+
+        # Initialize logger (only on main process)
+        if is_main_process():
+            self.logger = TrainingLogger(CONFIG["save_model_dir"], resume=CONFIG["resume"])
+        else:
+            self.logger = None
 
         # Create device
         if distributed:
@@ -388,10 +445,10 @@ class Trainer:
         gen_loss_avg = gen_loss_total / step
         disc_loss_avg = disc_loss_total / step
 
-        template = "GPU: {}, Generator loss: {}, Discriminator loss: {}"
+        template = "GPU: {}, Test Generator loss: {}, Test Discriminator loss: {}"
         logging.info(template.format(self.local_rank, gen_loss_avg, disc_loss_avg))
 
-        return gen_loss_avg
+        return gen_loss_avg, disc_loss_avg
 
     def train(self):
         for epoch in range(self.start_epoch, CONFIG["epochs"]):
@@ -402,19 +459,46 @@ class Trainer:
             self.model.train()
             self.discriminator.train()
 
+            # Track epoch losses
+            epoch_gen_loss_total = 0.0
+            epoch_disc_loss_total = 0.0
+            num_steps = 0
+
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
+                num_steps = step
                 loss, disc_loss = self.train_step(batch)
-                template = "GPU: {}, Epoch {}, Step {}, loss: {}, disc_loss: {}"
+                epoch_gen_loss_total += loss
+                epoch_disc_loss_total += disc_loss
+
+                # Log every log_interval steps
                 if (step % CONFIG["log_interval"]) == 0:
+                    template = "GPU: {}, Epoch {}, Step {}, loss: {:.6f}, disc_loss: {:.6f}"
                     logging.info(
                         template.format(self.local_rank, epoch, step, loss, disc_loss)
                     )
+                    # Log to CSV (only on main process)
+                    if self.logger is not None:
+                        lr_gen = self.optimizer.param_groups[0]['lr']
+                        lr_disc = self.optimizer_disc.param_groups[0]['lr']
+                        self.logger.log_step(epoch, step, loss, disc_loss, lr_gen, lr_disc)
 
-            gen_loss = self.test()
+            # Calculate epoch averages
+            train_gen_loss_avg = epoch_gen_loss_total / num_steps
+            train_disc_loss_avg = epoch_disc_loss_total / num_steps
+
+            # Run test
+            test_gen_loss, test_disc_loss = self.test()
+
+            # Log epoch summary to CSV (only on main process)
+            if self.logger is not None:
+                lr_gen = self.optimizer.param_groups[0]['lr']
+                lr_disc = self.optimizer_disc.param_groups[0]['lr']
+                self.logger.log_epoch(epoch, train_gen_loss_avg, train_disc_loss_avg,
+                                     test_gen_loss, test_disc_loss, lr_gen, lr_disc)
 
             # Save checkpoint (includes all states for resuming)
-            self.save_checkpoint(epoch, gen_loss)
+            self.save_checkpoint(epoch, test_gen_loss)
 
             # Synchronize all processes before next epoch
             if dist.is_initialized():

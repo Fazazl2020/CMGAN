@@ -2,7 +2,6 @@ from models.generator import TSCNet
 from models import discriminator
 import os
 import csv
-import glob
 from datetime import datetime
 import numpy as np
 from pesq import pesq
@@ -36,12 +35,9 @@ CONFIG = {
     "data_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/",  # dataset directory
     "save_model_dir": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN",  # directory to save model checkpoints
     "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
-    # ============== CHECKPOINT SETTINGS ==============
-    "keep_last_n_ckpts": 3,             # Keep only last N checkpoints (saves disk space)
-    "save_every_n_epochs": 10,          # Save model checkpoint every N epochs (in addition to last N)
     # ============== RESUME SETTINGS ==============
     "resume": False,                    # Set to True to resume training
-    "resume_checkpoint": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN/ckpt/checkpoint_epoch_0.pth",  # Full checkpoint path
+    "resume_checkpoint": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN/ckpt/latest_checkpoint.pth",  # Use latest for resume
     # =============================================
 }
 # ===========================================
@@ -256,7 +252,11 @@ class Trainer:
             print(f"Best loss so far: {self.best_loss:.6f}")
 
     def save_checkpoint(self, epoch, gen_loss, pesq_score):
-        """Save checkpoint with all states for resuming. Returns True if best model."""
+        """
+        Save checkpoints - simple strategy:
+        1. latest_checkpoint.pth - overwritten each epoch (for resume)
+        2. best_model.pth / best_checkpoint.pth - only when loss improves (for evaluation)
+        """
         if not is_main_process():
             return False
 
@@ -285,74 +285,20 @@ class Trainer:
             'config': CONFIG,
         }
 
-        # Always save latest checkpoint for resuming
-        checkpoint_path = os.path.join(self.ckpt_dir, f"checkpoint_epoch_{epoch}.pth")
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
+        # Save latest checkpoint (overwrite each epoch) - for resume
+        latest_ckpt_path = os.path.join(self.ckpt_dir, "latest_checkpoint.pth")
+        torch.save(checkpoint, latest_ckpt_path)
+        print(f"Saved latest checkpoint (epoch {epoch}): {latest_ckpt_path}")
 
-        # Save model-only at intervals (every N epochs) or if best
-        save_every_n = CONFIG.get("save_every_n_epochs", 10)
-        if (epoch + 1) % save_every_n == 0 or is_best:
-            model_path = os.path.join(
-                self.ckpt_dir,
-                f"CMGAN_epoch_{epoch}_loss_{gen_loss:.4f}_pesq_{pesq_score:.3f}.pth"
-            )
-            torch.save(model_state, model_path)
-            print(f"Saved model: {model_path}")
-
-        # Save best model separately
+        # Save best model (only when loss improves) - for evaluation
         if is_best:
-            best_path = os.path.join(self.ckpt_dir, "best_model.pth")
-            torch.save(model_state, best_path)
-            best_checkpoint_path = os.path.join(self.ckpt_dir, "best_checkpoint.pth")
-            torch.save(checkpoint, best_checkpoint_path)
-            print(f"*** New best model saved! Loss: {gen_loss:.6f}, PESQ: {pesq_score:.4f} ***")
-
-        # Cleanup: keep only last N checkpoints (but never delete best or interval saves)
-        self._cleanup_old_checkpoints(epoch)
+            best_model_path = os.path.join(self.ckpt_dir, "best_model.pth")
+            torch.save(model_state, best_model_path)
+            best_ckpt_path = os.path.join(self.ckpt_dir, "best_checkpoint.pth")
+            torch.save(checkpoint, best_ckpt_path)
+            print(f"*** New best model! Epoch: {epoch}, Loss: {gen_loss:.6f}, PESQ: {pesq_score:.4f} ***")
 
         return is_best
-
-    def _cleanup_old_checkpoints(self, current_epoch):
-        """Remove old checkpoints, keeping only last N."""
-        keep_last_n = CONFIG.get("keep_last_n_ckpts", 3)
-        save_every_n = CONFIG.get("save_every_n_epochs", 10)
-
-        # Find all checkpoint files
-        ckpt_pattern = os.path.join(self.ckpt_dir, "checkpoint_epoch_*.pth")
-        ckpt_files = glob.glob(ckpt_pattern)
-
-        # Extract epoch numbers and sort
-        epoch_files = []
-        for f in ckpt_files:
-            try:
-                # Extract epoch number from filename
-                basename = os.path.basename(f)
-                epoch_num = int(basename.replace("checkpoint_epoch_", "").replace(".pth", ""))
-                epoch_files.append((epoch_num, f))
-            except ValueError:
-                continue
-
-        epoch_files.sort(key=lambda x: x[0])
-
-        # Determine which to keep
-        epochs_to_keep = set()
-        # Keep last N
-        for epoch_num, _ in epoch_files[-keep_last_n:]:
-            epochs_to_keep.add(epoch_num)
-        # Keep interval saves (0, 9, 19, 29, ... for save_every_n=10)
-        for epoch_num, _ in epoch_files:
-            if (epoch_num + 1) % save_every_n == 0:
-                epochs_to_keep.add(epoch_num)
-
-        # Delete old checkpoints
-        for epoch_num, filepath in epoch_files:
-            if epoch_num not in epochs_to_keep:
-                try:
-                    os.remove(filepath)
-                    print(f"Cleaned up old checkpoint: {filepath}")
-                except OSError:
-                    pass
 
     def forward_generator_step(self, clean, noisy):
 

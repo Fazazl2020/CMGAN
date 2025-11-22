@@ -31,6 +31,10 @@ CONFIG = {
     "data_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/",  # dataset directory
     "save_model_dir": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN",  # directory to save model checkpoints
     "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
+    # ============== RESUME SETTINGS ==============
+    "resume": False,                    # Set to True to resume training
+    "resume_checkpoint": "",            # Path to checkpoint file to resume from (e.g., "/path/to/checkpoint_epoch_10.pth")
+    # =============================================
 }
 # ===========================================
 
@@ -95,6 +99,7 @@ class Trainer:
         self.test_ds = test_ds
         self.local_rank = local_rank
         self.distributed = distributed
+        self.start_epoch = 0  # Will be updated if resuming
 
         # Create device
         if distributed:
@@ -126,10 +131,92 @@ class Trainer:
             self.discriminator.parameters(), lr=2 * CONFIG["init_lr"]
         )
 
-        # Wrap models with DDP if distributed
+        # Create schedulers
+        self.scheduler_G = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=CONFIG["decay_epoch"], gamma=0.5
+        )
+        self.scheduler_D = torch.optim.lr_scheduler.StepLR(
+            self.optimizer_disc, step_size=CONFIG["decay_epoch"], gamma=0.5
+        )
+
+        # Load checkpoint if resuming
+        if CONFIG["resume"] and CONFIG["resume_checkpoint"]:
+            self.load_checkpoint(CONFIG["resume_checkpoint"])
+
+        # Wrap models with DDP if distributed (AFTER loading checkpoint)
         if distributed:
             self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank)
             self.discriminator = DDP(self.discriminator, device_ids=[local_rank], output_device=local_rank)
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint to resume training."""
+        if not os.path.exists(checkpoint_path):
+            if is_main_process():
+                print(f"Checkpoint not found: {checkpoint_path}")
+            return
+
+        if is_main_process():
+            print(f"Loading checkpoint from: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load model states
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+
+        # Load optimizer states
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.optimizer_disc.load_state_dict(checkpoint['optimizer_disc_state_dict'])
+
+        # Load scheduler states
+        self.scheduler_G.load_state_dict(checkpoint['scheduler_G_state_dict'])
+        self.scheduler_D.load_state_dict(checkpoint['scheduler_D_state_dict'])
+
+        # Set start epoch (resume from next epoch)
+        self.start_epoch = checkpoint['epoch'] + 1
+
+        if is_main_process():
+            print(f"Resumed from epoch {checkpoint['epoch']}, will start from epoch {self.start_epoch}")
+
+    def save_checkpoint(self, epoch, gen_loss):
+        """Save checkpoint with all states for resuming."""
+        if not is_main_process():
+            return
+
+        if not os.path.exists(CONFIG["save_model_dir"]):
+            os.makedirs(CONFIG["save_model_dir"])
+
+        # Get model state dict (unwrap DDP if needed)
+        model_state = self.model.module.state_dict() if self.distributed else self.model.state_dict()
+        disc_state = self.discriminator.module.state_dict() if self.distributed else self.discriminator.state_dict()
+
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model_state,
+            'discriminator_state_dict': disc_state,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_disc_state_dict': self.optimizer_disc.state_dict(),
+            'scheduler_G_state_dict': self.scheduler_G.state_dict(),
+            'scheduler_D_state_dict': self.scheduler_D.state_dict(),
+            'gen_loss': gen_loss,
+            'config': CONFIG,
+        }
+
+        # Save full checkpoint for resuming
+        checkpoint_path = os.path.join(
+            CONFIG["save_model_dir"],
+            f"checkpoint_epoch_{epoch}.pth"
+        )
+        torch.save(checkpoint, checkpoint_path)
+
+        # Also save model-only checkpoint (for evaluation)
+        model_path = os.path.join(
+            CONFIG["save_model_dir"],
+            "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
+        )
+        torch.save(model_state, model_path)
+
+        print(f"Saved checkpoint: {checkpoint_path}")
 
     def forward_generator_step(self, clean, noisy):
 
@@ -307,14 +394,7 @@ class Trainer:
         return gen_loss_avg
 
     def train(self):
-        scheduler_G = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=CONFIG["decay_epoch"], gamma=0.5
-        )
-        scheduler_D = torch.optim.lr_scheduler.StepLR(
-            self.optimizer_disc, step_size=CONFIG["decay_epoch"], gamma=0.5
-        )
-
-        for epoch in range(CONFIG["epochs"]):
+        for epoch in range(self.start_epoch, CONFIG["epochs"]):
             # Set epoch for distributed sampler (important for proper shuffling!)
             if self.distributed and hasattr(self.train_ds, 'sampler') and self.train_ds.sampler is not None:
                 self.train_ds.sampler.set_epoch(epoch)
@@ -333,25 +413,15 @@ class Trainer:
 
             gen_loss = self.test()
 
-            # Only main process saves checkpoints (avoid race condition)
-            if is_main_process():
-                if not os.path.exists(CONFIG["save_model_dir"]):
-                    os.makedirs(CONFIG["save_model_dir"])
-
-                path = os.path.join(
-                    CONFIG["save_model_dir"],
-                    "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
-                )
-                # Save model state dict (unwrap DDP if needed)
-                model_to_save = self.model.module if self.distributed else self.model
-                torch.save(model_to_save.state_dict(), path)
+            # Save checkpoint (includes all states for resuming)
+            self.save_checkpoint(epoch, gen_loss)
 
             # Synchronize all processes before next epoch
             if dist.is_initialized():
                 dist.barrier()
 
-            scheduler_G.step()
-            scheduler_D.step()
+            self.scheduler_G.step()
+            self.scheduler_D.step()
 
 
 def main():
@@ -370,6 +440,8 @@ def main():
         print(f"Distributed: {distributed}")
         print(f"World size (GPUs): {world_size}")
         print(f"Rank: {rank}, Local Rank: {local_rank}")
+        if CONFIG["resume"]:
+            print(f"Resuming from: {CONFIG['resume_checkpoint']}")
         available_gpus = [
             torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
         ]

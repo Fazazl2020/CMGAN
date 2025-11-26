@@ -12,8 +12,15 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 class DemandDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir, cut_len=16000 * 2):
+    def __init__(self, data_dir, cut_len=16000 * 2, mode='train'):
+        """
+        Args:
+            data_dir: Directory containing clean and noisy subdirectories
+            cut_len: Length to cut audio segments
+            mode: 'train' for random cutting (data augmentation), 'test' for center cutting (consistent evaluation)
+        """
         self.cut_len = cut_len
+        self.mode = mode
         self.clean_dir = os.path.join(data_dir, "clean")
         self.noisy_dir = os.path.join(data_dir, "noisy")
         self.clean_wav_name = os.listdir(self.clean_dir)
@@ -44,8 +51,14 @@ class DemandDataset(torch.utils.data.Dataset):
             clean_ds = torch.cat(clean_ds_final, dim=-1)
             noisy_ds = torch.cat(noisy_ds_final, dim=-1)
         else:
-            # randomly cut 2 seconds segment
-            wav_start = random.randint(0, length - self.cut_len)
+            # Cut 2 seconds segment
+            if self.mode == 'train':
+                # Random cutting for data augmentation during training
+                wav_start = random.randint(0, length - self.cut_len)
+            else:
+                # Fixed center cutting for consistent test evaluation
+                wav_start = (length - self.cut_len) // 2
+
             noisy_ds = noisy_ds[wav_start : wav_start + self.cut_len]
             clean_ds = clean_ds[wav_start : wav_start + self.cut_len]
 
@@ -61,8 +74,9 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len):
     train_dir = os.path.join(ds_dir, "train")
     test_dir = os.path.join(ds_dir, "test")
 
-    train_ds = DemandDataset(train_dir, cut_len)
-    test_ds = DemandDataset(test_dir, cut_len)
+    # Use 'train' mode for random cutting, 'test' mode for consistent evaluation
+    train_ds = DemandDataset(train_dir, cut_len, mode='train')
+    test_ds = DemandDataset(test_dir, cut_len, mode='test')
 
     # Check if distributed training is enabled
     distributed = dist.is_initialized()

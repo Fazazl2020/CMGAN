@@ -386,7 +386,8 @@ class Trainer:
         length = generator_outputs["est_audio"].size(-1)
         est_audio_list = list(generator_outputs["est_audio"].detach().cpu().numpy())
         clean_audio_list = list(generator_outputs["clean"].cpu().numpy()[:, :length])
-        pesq_score = discriminator.batch_pesq(clean_audio_list, est_audio_list)
+        # Pass device for DDP compatibility (ensures pesq_score is on same GPU as model)
+        pesq_score = discriminator.batch_pesq(clean_audio_list, est_audio_list, device=self.device)
 
         # The calculation of PESQ can be None due to silent part
         if pesq_score is not None:

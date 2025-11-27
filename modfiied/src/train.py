@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Modify these values according to your setup
 CONFIG = {
     "epochs": 120,                      # number of epochs of training
-    "batch_size": 1,                    # batch size PER GPU (reduced to 1 for tight GPU memory)
+    "batch_size": 4,                    # batch size PER GPU (CRITICAL: must be >= 4 for stable GAN training)
     "log_interval": 500,                # logging interval (steps)
     "decay_epoch": 30,                  # epoch from which to start lr decay
     "init_lr": 5e-4,                    # initial learning rate

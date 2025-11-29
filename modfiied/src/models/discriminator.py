@@ -15,7 +15,7 @@ def pesq_loss(clean, noisy, sr=16000):
     return pesq_score
 
 
-def batch_pesq(clean, noisy):
+def batch_pesq(clean, noisy, device="cuda"):
     """
     Compute PESQ scores for a batch of audio samples.
 
@@ -25,6 +25,11 @@ def batch_pesq(clean, noisy):
 
     Hypothesis: Original code's batch skipping may cause discriminator
     undertraining, leading to PESQ degradation after epoch 6-7.
+
+    Args:
+        clean: List of clean audio samples (numpy arrays)
+        noisy: List of noisy audio samples (numpy arrays)
+        device: torch device to place the result tensor on (for DDP compatibility)
     """
     pesq_score = Parallel(n_jobs=-1)(
         delayed(pesq_loss)(c, n) for c, n in zip(clean, noisy)
@@ -43,7 +48,8 @@ def batch_pesq(clean, noisy):
         pesq_normalized = (pesq_mean - 1) / 3.5
 
     # Return same score for entire batch (for loss computation)
-    return torch.FloatTensor([pesq_normalized] * len(pesq_score)).to("cuda")
+    # Use provided device for DDP compatibility (cuda:0/1/2/3)
+    return torch.FloatTensor([pesq_normalized] * len(pesq_score)).to(device)
 
 
 class Discriminator(nn.Module):

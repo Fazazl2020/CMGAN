@@ -35,6 +35,14 @@ CONFIG = {
     "data_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/",  # dataset directory
     "save_model_dir": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN",  # directory to save model checkpoints
     "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
+    # ============== EARLY STOPPING SETTINGS ==============
+    "early_stopping": True,             # Enable early stopping to prevent overfitting
+    "patience": 15,                     # Stop if test loss doesn't improve for N epochs
+    "min_delta": 0.0001,                # Minimum change to qualify as improvement
+    # =====================================================
+    # ============== GRADIENT CLIPPING ==============
+    "gradient_clip_norm": 5.0,          # Clip gradients to prevent instability (0 = disabled)
+    # ===============================================
     # ============== RESUME SETTINGS ==============
     "resume": False,                    # Set to True to resume training
     "resume_checkpoint": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN/ckpt/latest_checkpoint.pth",  # Use latest for resume
@@ -158,6 +166,11 @@ class Trainer:
         self.start_epoch = 0  # Will be updated if resuming
         self.best_loss = float('inf')  # Track best model
 
+        # Early stopping variables
+        self.patience_counter = 0
+        self.best_val_loss = float('inf')
+        self.early_stop = False
+
         # Create checkpoint and logs directories
         self.ckpt_dir = os.path.join(CONFIG["save_model_dir"], "ckpt")
         if is_main_process():
@@ -247,9 +260,16 @@ class Trainer:
         if 'best_loss' in checkpoint:
             self.best_loss = checkpoint['best_loss']
 
+        # Load early stopping state if available
+        if 'best_val_loss' in checkpoint:
+            self.best_val_loss = checkpoint['best_val_loss']
+        if 'patience_counter' in checkpoint:
+            self.patience_counter = checkpoint['patience_counter']
+
         if is_main_process():
             print(f"Resumed from epoch {checkpoint['epoch']}, will start from epoch {self.start_epoch}")
             print(f"Best loss so far: {self.best_loss:.6f}")
+            print(f"Early stopping - Best val loss: {self.best_val_loss:.6f}, Patience: {self.patience_counter}/{CONFIG['patience']}")
 
     def save_checkpoint(self, epoch, gen_loss, pesq_score):
         """
@@ -282,6 +302,8 @@ class Trainer:
             'gen_loss': gen_loss,
             'pesq_score': pesq_score,
             'best_loss': self.best_loss,
+            'best_val_loss': self.best_val_loss,
+            'patience_counter': self.patience_counter,
             'config': CONFIG,
         }
 
@@ -422,6 +444,11 @@ class Trainer:
         loss = self.calculate_generator_loss(generator_outputs)
         self.optimizer.zero_grad()
         loss.backward()
+
+        # Gradient clipping for generator (prevents training instability)
+        if CONFIG["gradient_clip_norm"] > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), CONFIG["gradient_clip_norm"])
+
         self.optimizer.step()
 
         # Train Discriminator
@@ -430,6 +457,11 @@ class Trainer:
         if discrim_loss_metric is not None:
             self.optimizer_disc.zero_grad()
             discrim_loss_metric.backward()
+
+            # Gradient clipping for discriminator (prevents training instability)
+            if CONFIG["gradient_clip_norm"] > 0:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), CONFIG["gradient_clip_norm"])
+
             self.optimizer_disc.step()
         else:
             discrim_loss_metric = torch.tensor([0.0])
@@ -547,6 +579,33 @@ class Trainer:
             # Run test (returns loss and PESQ)
             test_gen_loss, test_disc_loss, test_pesq = self.test()
 
+            # ============== EARLY STOPPING LOGIC ==============
+            # Check if validation loss improved
+            if CONFIG["early_stopping"]:
+                if test_gen_loss < (self.best_val_loss - CONFIG["min_delta"]):
+                    # Significant improvement
+                    self.best_val_loss = test_gen_loss
+                    self.patience_counter = 0
+                    if is_main_process():
+                        print(f"[Early Stopping] Validation loss improved to {test_gen_loss:.6f}")
+                else:
+                    # No improvement
+                    self.patience_counter += 1
+                    if is_main_process():
+                        print(f"[Early Stopping] No improvement for {self.patience_counter}/{CONFIG['patience']} epochs")
+
+                    # Check if we should stop
+                    if self.patience_counter >= CONFIG["patience"]:
+                        if is_main_process():
+                            print(f"\n{'='*60}")
+                            print(f"EARLY STOPPING TRIGGERED!")
+                            print(f"No improvement in validation loss for {CONFIG['patience']} epochs")
+                            print(f"Best validation loss: {self.best_val_loss:.6f}")
+                            print(f"Stopping at epoch {epoch}")
+                            print(f"{'='*60}\n")
+                        self.early_stop = True
+            # ==================================================
+
             # Save checkpoint (includes all states for resuming)
             is_best = self.save_checkpoint(epoch, test_gen_loss, test_pesq)
 
@@ -565,7 +624,15 @@ class Trainer:
                 print(f"  Train Loss: {train_gen_loss_avg:.6f}, Disc Loss: {train_disc_loss_avg:.6f}")
                 print(f"  Test Loss: {test_gen_loss:.6f}, Test PESQ: {test_pesq:.4f}")
                 print(f"  Best Model: {'YES' if is_best else 'NO'} (Best Loss: {self.best_loss:.6f})")
+                if CONFIG["early_stopping"]:
+                    print(f"  Early Stopping: {self.patience_counter}/{CONFIG['patience']} (Best Val: {self.best_val_loss:.6f})")
                 print(f"{'='*60}\n")
+
+            # Check if early stopping triggered - break before scheduler step
+            if self.early_stop:
+                if is_main_process():
+                    print("Training stopped early due to no improvement in validation loss")
+                break
 
             # Synchronize all processes before next epoch
             if dist.is_initialized():

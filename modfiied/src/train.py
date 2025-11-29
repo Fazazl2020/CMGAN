@@ -443,6 +443,9 @@ class Trainer:
         noisy = batch[1].to(self.device)
         one_labels = torch.ones(clean.size(0)).to(self.device)  # Use actual batch size
 
+        # Compute normalization factor for denormalization later
+        c = torch.sqrt(noisy.size(-1) / torch.sum((noisy**2.0), dim=-1))
+
         generator_outputs = self.forward_generator_step(
             clean,
             noisy,
@@ -456,8 +459,8 @@ class Trainer:
         if discrim_loss_metric is None:
             discrim_loss_metric = torch.tensor([0.0])
 
-        # Return est_audio and clean for PESQ calculation (avoid double forward pass)
-        return loss.item(), discrim_loss_metric.item(), generator_outputs["est_audio"], clean
+        # Return est_audio, clean, and normalization factor for proper PESQ calculation
+        return loss.item(), discrim_loss_metric.item(), generator_outputs["est_audio"], clean, c
 
     def test(self):
         """Run test/validation and compute PESQ score."""
@@ -469,16 +472,26 @@ class Trainer:
 
         for idx, batch in enumerate(self.test_ds):
             step = idx + 1
-            loss, disc_loss, est_audio, clean = self.test_step(batch)
+            loss, disc_loss, est_audio, clean, c = self.test_step(batch)
             gen_loss_total += loss
             disc_loss_total += disc_loss
 
-            # Compute PESQ for each sample in batch (using output from test_step)
-            length = est_audio.size(-1)
-            for i in range(est_audio.size(0)):
+            # CRITICAL FIX: Denormalize est_audio before computing PESQ
+            # The forward pass normalizes audio by factor c (computed from noisy energy)
+            # We must denormalize to get correct energy for PESQ computation
+            # This matches evaluation.py behavior (line 51: est_audio = est_audio / c)
+            c = c.unsqueeze(-1)  # Shape: [batch, 1] for broadcasting
+            est_audio_denorm = est_audio / c
+
+            # Also denormalize clean audio
+            clean_denorm = clean / c
+
+            # Compute PESQ for each sample in batch (using DENORMALIZED audio)
+            length = est_audio_denorm.size(-1)
+            for i in range(est_audio_denorm.size(0)):
                 try:
-                    est_np = est_audio[i].cpu().numpy()
-                    clean_np = clean[i, :length].cpu().numpy()
+                    est_np = est_audio_denorm[i].cpu().numpy()
+                    clean_np = clean_denorm[i, :length].cpu().numpy()
                     # PESQ requires 16kHz sample rate
                     score = pesq(16000, clean_np, est_np, 'wb')
                     pesq_scores.append(score)

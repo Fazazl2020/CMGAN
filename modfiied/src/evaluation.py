@@ -80,17 +80,25 @@ def evaluation(model_path, noisy_dir, clean_dir, save_tracks, saved_dir):
     audio_list = natsorted(audio_list)
     num = len(audio_list)
     metrics_total = np.zeros(6)
-    for audio in audio_list:
+    for idx, audio in enumerate(audio_list):
         noisy_path = os.path.join(noisy_dir, audio)
         clean_path = os.path.join(clean_dir, audio)
+        # FIXED: Use smaller cut_len to avoid OOM (out of memory) errors
+        # Changed from 16000*16 (16 seconds) to 16000*4 (4 seconds)
+        # This prevents memory issues with long audio files
         est_audio, length = enhance_one_track(
-            model, noisy_path, saved_dir, 16000 * 16, n_fft, n_fft // 4, save_tracks
+            model, noisy_path, saved_dir, 16000 * 4, n_fft, n_fft // 4, save_tracks
         )
         clean_audio, sr = sf.read(clean_path)
         assert sr == 16000
         metrics = compute_metrics(clean_audio, est_audio, sr, 0)
         metrics = np.array(metrics)
         metrics_total += metrics
+
+        # Clear GPU cache every 10 files to prevent memory buildup
+        if (idx + 1) % 10 == 0:
+            torch.cuda.empty_cache()
+            print(f"Processed {idx + 1}/{num} files...")
 
     metrics_avg = metrics_total / num
     print(

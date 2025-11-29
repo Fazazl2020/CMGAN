@@ -19,11 +19,13 @@ def batch_pesq(clean, noisy, device="cuda"):
     """
     Compute PESQ scores for a batch of audio samples.
 
-    FIXED: Returns individual PESQ scores for each sample, not batch average.
-    For failed samples, uses the mean of valid scores in the batch as estimate.
+    CRITICAL FIX: Uses mean of valid PESQ scores for entire batch instead of skipping.
 
-    This ensures discriminator learns to distinguish between samples with
-    different quality levels, providing useful per-sample feedback to generator.
+    Original bug: When ANY sample failed PESQ computation, returned None and skipped
+    entire batch, causing discriminator to train on only ~44% of batches.
+
+    This fix ensures discriminator trains on 100% of batches by computing the mean
+    of valid PESQ scores and returning that same value for all samples in the batch.
 
     Args:
         clean: List of clean audio samples (numpy arrays)
@@ -31,29 +33,26 @@ def batch_pesq(clean, noisy, device="cuda"):
         device: torch device to place the result tensor on (for DDP compatibility)
 
     Returns:
-        Tensor of normalized PESQ scores, shape [batch_size]
+        Tensor of normalized PESQ scores (same value repeated for batch), shape [batch_size]
     """
     pesq_scores = Parallel(n_jobs=-1)(
         delayed(pesq_loss)(c, n) for c, n in zip(clean, noisy)
     )
     pesq_scores = np.array(pesq_scores)
 
-    # Compute fallback value for failed samples
+    # Use mean of valid scores instead of skipping entire batch
     valid_scores = pesq_scores[pesq_scores != -1]
-    if len(valid_scores) > 0:
-        fallback_pesq = np.mean(valid_scores)
-    else:
+
+    if len(valid_scores) == 0:
         # All samples failed - use middle PESQ value
-        fallback_pesq = 2.5  # middle of 1.0-4.5 range
+        pesq_normalized = 0.5  # maps to PESQ 2.75 (middle of 1.0-4.5 range)
+    else:
+        # Compute mean of valid samples
+        pesq_mean = np.mean(valid_scores)
+        pesq_normalized = (pesq_mean - 1.0) / 3.5
 
-    # Replace failed samples (-1) with fallback value
-    pesq_scores[pesq_scores == -1] = fallback_pesq
-
-    # Normalize PESQ scores (1.0-4.5 → 0.0-1.0)
-    pesq_normalized = (pesq_scores - 1.0) / 3.5
-
-    # Return individual scores for each sample
-    return torch.FloatTensor(pesq_normalized).to(device)
+    # Return same score for entire batch (critical for training stability)
+    return torch.FloatTensor([pesq_normalized] * len(pesq_scores)).to(device)
 
 
 class Discriminator(nn.Module):

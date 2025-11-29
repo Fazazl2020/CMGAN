@@ -36,27 +36,58 @@ def enhance_one_track(
     padded_len = frame_num * 100
     padding_len = padded_len - length
     noisy = torch.cat([noisy, noisy[:, :padding_len]], dim=-1)
+
+    # MEMORY OPTIMIZATION: Process chunks sequentially instead of all at once
+    # Original code processes all chunks simultaneously (high memory)
+    # This version processes one chunk at a time (low memory, identical results)
     if padded_len > cut_len:
         batch_size = int(np.ceil(padded_len / cut_len))
         while 100 % batch_size != 0:
             batch_size += 1
-        noisy = torch.reshape(noisy, (batch_size, -1))
+        noisy_chunks = torch.reshape(noisy, (batch_size, -1))
 
-    noisy_spec = torch.stft(
-        noisy, n_fft, hop, window=torch.hamming_window(n_fft).cuda(), onesided=True
-    )
-    noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
-    est_real, est_imag = model(noisy_spec)
-    est_real, est_imag = est_real.permute(0, 1, 3, 2), est_imag.permute(0, 1, 3, 2)
+        # Process each chunk separately to save memory
+        est_audio_chunks = []
+        for i in range(batch_size):
+            chunk = noisy_chunks[i:i+1]  # Single chunk [1, chunk_len]
 
-    est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
-    est_audio = torch.istft(
-        est_spec_uncompress,
-        n_fft,
-        hop,
-        window=torch.hamming_window(n_fft).cuda(),
-        onesided=True,
-    )
+            noisy_spec = torch.stft(
+                chunk, n_fft, hop, window=torch.hamming_window(n_fft).cuda(), onesided=True
+            )
+            noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
+            est_real, est_imag = model(noisy_spec)
+            est_real, est_imag = est_real.permute(0, 1, 3, 2), est_imag.permute(0, 1, 3, 2)
+
+            est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
+            est_audio_chunk = torch.istft(
+                est_spec_uncompress,
+                n_fft,
+                hop,
+                window=torch.hamming_window(n_fft).cuda(),
+                onesided=True,
+            )
+            est_audio_chunks.append(est_audio_chunk)
+
+        # Concatenate all chunks
+        est_audio = torch.cat(est_audio_chunks, dim=-1)
+    else:
+        # Short audio, process directly (same as original)
+        noisy_spec = torch.stft(
+            noisy, n_fft, hop, window=torch.hamming_window(n_fft).cuda(), onesided=True
+        )
+        noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
+        est_real, est_imag = model(noisy_spec)
+        est_real, est_imag = est_real.permute(0, 1, 3, 2), est_imag.permute(0, 1, 3, 2)
+
+        est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
+        est_audio = torch.istft(
+            est_spec_uncompress,
+            n_fft,
+            hop,
+            window=torch.hamming_window(n_fft).cuda(),
+            onesided=True,
+        )
+
     est_audio = est_audio / c
     est_audio = torch.flatten(est_audio)[:length].cpu().numpy()
     assert len(est_audio) == length
@@ -83,11 +114,10 @@ def evaluation(model_path, noisy_dir, clean_dir, save_tracks, saved_dir):
     for idx, audio in enumerate(audio_list):
         noisy_path = os.path.join(noisy_dir, audio)
         clean_path = os.path.join(clean_dir, audio)
-        # FIXED: Use smaller cut_len to avoid OOM (out of memory) errors
-        # Changed from 16000*16 (16 seconds) to 16000*4 (4 seconds)
-        # This prevents memory issues with long audio files
+        # Using ORIGINAL cut_len (16 seconds) - same as original CMGAN
+        # Sequential chunk processing avoids OOM while giving identical results
         est_audio, length = enhance_one_track(
-            model, noisy_path, saved_dir, 16000 * 4, n_fft, n_fft // 4, save_tracks
+            model, noisy_path, saved_dir, 16000 * 16, n_fft, n_fft // 4, save_tracks
         )
         clean_audio, sr = sf.read(clean_path)
         assert sr == 16000

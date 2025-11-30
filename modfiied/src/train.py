@@ -372,6 +372,7 @@ class Trainer:
             "clean_imag": clean_imag,
             "clean_mag": clean_mag,
             "est_audio": est_audio,
+            "norm_factor": c,  # CRITICAL: Return normalization factor for PESQ denormalization
         }
 
     def calculate_generator_loss(self, generator_outputs):
@@ -405,9 +406,16 @@ class Trainer:
 
     def calculate_discriminator_loss(self, generator_outputs):
 
-        length = generator_outputs["est_audio"].size(-1)
-        est_audio_list = list(generator_outputs["est_audio"].detach().cpu().numpy())
-        clean_audio_list = list(generator_outputs["clean"].cpu().numpy()[:, :length])
+        # CRITICAL FIX: Denormalize audio before PESQ computation
+        # The forward pass normalizes audio by factor c (computed from noisy energy)
+        # We must denormalize to get correct energy for PESQ computation
+        c = generator_outputs["norm_factor"].unsqueeze(-1)  # Shape: [batch, 1] for broadcasting
+        est_audio_denorm = generator_outputs["est_audio"] / c
+        clean_denorm = generator_outputs["clean"] / c
+
+        length = est_audio_denorm.size(-1)
+        est_audio_list = list(est_audio_denorm.detach().cpu().numpy())
+        clean_audio_list = list(clean_denorm.cpu().numpy()[:, :length])
         # Pass device for DDP compatibility (ensures pesq_score is on same GPU as model)
         pesq_score = discriminator.batch_pesq(clean_audio_list, est_audio_list, device=self.device)
 

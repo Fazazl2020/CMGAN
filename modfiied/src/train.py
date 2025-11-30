@@ -34,10 +34,10 @@ CONFIG = {
     "cut_len": 16000 * 2,               # cut length, 2 seconds for denoise/dereverberation
     "data_dir": "/gdata/fewahab/data/Voicebank+demand/My_train_valid_test/",  # dataset directory
     "save_model_dir": "/ghome/fewahab/Sun-Models/Ab-5/CMGAN",  # directory to save model checkpoints
-    "loss_weights": [0.1, 0.9, 0.2, 0.05],  # weights: RI components, magnitude, time loss, Metric Disc
+    "loss_weights": [0.1, 0.5, 0.2, 0.2],  # CRITICAL FIX: Reduce mag (0.9→0.5), increase GAN (0.05→0.2) for better PESQ correlation
     # ============== EARLY STOPPING SETTINGS ==============
     "early_stopping": True,             # Enable early stopping to prevent overfitting
-    "patience": 15,                     # Stop if test loss doesn't improve for N epochs
+    "patience": 10,                     # Stop if test loss doesn't improve for N epochs (reduced from 15)
     "min_delta": 0.0001,                # Minimum change to qualify as improvement
     # =====================================================
     # ============== GRADIENT CLIPPING ==============
